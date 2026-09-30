@@ -1,8 +1,10 @@
 import os
 import asyncio
-import sqlite3
 import time
 import logging
+
+import psycopg
+from psycopg.rows import dict_row
 
 from telegram import Update
 from telegram.error import TelegramError, RetryAfter, Forbidden
@@ -22,6 +24,8 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 
 ADMIN_ID = 7105146175
 
+DATABASE_URL = os.environ["DATABASE_URL"]
+
 # Existing broadcast messages
 DELETE_AFTER = 24 * 60 * 60
 
@@ -33,63 +37,7 @@ SEND_DELAY = 0.06
 
 
 # =========================================================
-# 2. DATABASE
-# =========================================================
-
-db = sqlite3.connect(
-    "broadcast_bot.db",
-    check_same_thread=False
-)
-
-db.execute("""
-CREATE TABLE IF NOT EXISTS users (
-    chat_id INTEGER PRIMARY KEY
-)
-""")
-
-db.execute("""
-CREATE TABLE IF NOT EXISTS messages (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    chat_id INTEGER NOT NULL,
-    message_id INTEGER NOT NULL,
-    delete_at INTEGER NOT NULL
-)
-""")
-
-# Video packs
-db.execute("""
-CREATE TABLE IF NOT EXISTS packs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    pack_code TEXT UNIQUE NOT NULL,
-    created_at INTEGER NOT NULL
-)
-""")
-
-# Messages inside packs
-db.execute("""
-CREATE TABLE IF NOT EXISTS pack_items (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    pack_id INTEGER NOT NULL,
-    source_chat_id INTEGER NOT NULL,
-    source_message_id INTEGER NOT NULL
-)
-""")
-
-# User's pack messages, so they can be deleted after 1 hour
-db.execute("""
-CREATE TABLE IF NOT EXISTS pack_messages (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    chat_id INTEGER NOT NULL,
-    message_id INTEGER NOT NULL,
-    delete_at INTEGER NOT NULL
-)
-""")
-
-db.commit()
-
-
-# =========================================================
-# 3. LOGGING
+# 2. LOGGING
 # =========================================================
 
 logging.basicConfig(
@@ -101,45 +49,172 @@ logger = logging.getLogger(__name__)
 
 
 # =========================================================
-# 4. /START
+# 3. DATABASE CONNECTION
 # =========================================================
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def get_db():
+    return psycopg.connect(
+        DATABASE_URL,
+        row_factory=dict_row
+    )
+
+
+# =========================================================
+# 4. DATABASE SETUP
+# =========================================================
+
+def init_database():
+
+    with get_db() as conn:
+
+        # Users / subscribers
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                chat_id BIGINT PRIMARY KEY
+            )
+        """)
+
+        # Normal broadcast messages
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS messages (
+                id BIGSERIAL PRIMARY KEY,
+                chat_id BIGINT NOT NULL,
+                message_id BIGINT NOT NULL,
+                delete_at BIGINT NOT NULL
+            )
+        """)
+
+        # Video packs
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS packs (
+                id BIGSERIAL PRIMARY KEY,
+                pack_code TEXT UNIQUE NOT NULL,
+                created_at BIGINT NOT NULL
+            )
+        """)
+
+        # Messages inside packs
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS pack_items (
+                id BIGSERIAL PRIMARY KEY,
+                pack_id BIGINT NOT NULL,
+                source_chat_id BIGINT NOT NULL,
+                source_message_id BIGINT NOT NULL
+            )
+        """)
+
+        # Pack messages sent to users
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS pack_messages (
+                id BIGSERIAL PRIMARY KEY,
+                chat_id BIGINT NOT NULL,
+                message_id BIGINT NOT NULL,
+                delete_at BIGINT NOT NULL
+            )
+        """)
+
+        conn.commit()
+
+    logger.info("DATABASE READY")
+
+
+# =========================================================
+# 5. /START
+# =========================================================
+
+async def start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     chat_id = update.effective_chat.id
 
-    # Check if this is a pack deep-link
+    # =====================================================
+    # AUTO SUBSCRIBE
+    # =====================================================
+
+    try:
+
+        with get_db() as conn:
+
+            conn.execute(
+                """
+                INSERT INTO users(chat_id)
+                VALUES(%s)
+                ON CONFLICT (chat_id) DO NOTHING
+                """,
+                (chat_id,)
+            )
+
+            conn.commit()
+
+        logger.info(
+            "User registered: %s",
+            chat_id
+        )
+
+    except Exception as e:
+
+        logger.error(
+            "User registration error: %s",
+            e
+        )
+
+        await update.message.reply_text(
+            "❌ Database error. Please try again."
+        )
+
+        return
+
+    # =====================================================
+    # PACK DEEP LINK
+    # =====================================================
+
     args = context.args
 
     if args:
+
         pack_code = args[0]
 
-        pack = db.execute(
-            "SELECT id FROM packs WHERE pack_code=?",
-            (pack_code,)
-        ).fetchone()
+        try:
+
+            with get_db() as conn:
+
+                pack = conn.execute(
+                    """
+                    SELECT id
+                    FROM packs
+                    WHERE pack_code=%s
+                    """,
+                    (pack_code,)
+                ).fetchone()
+
+        except Exception as e:
+
+            logger.error(
+                "Pack lookup error: %s",
+                e
+            )
+
+            await update.message.reply_text(
+                "❌ Database error. Please try again."
+            )
+
+            return
 
         if pack:
-    db.execute(
-        "INSERT OR IGNORE INTO users(chat_id) VALUES(?)",
-        (chat_id,)
-    )
-    db.commit()
 
-    await send_pack(
-        update,
-        context,
-        pack[0]
-    )
-    return
+            await send_pack(
+                update,
+                context,
+                pack["id"]
+            )
 
-    # Normal subscription
-    db.execute(
-        "INSERT OR IGNORE INTO users(chat_id) VALUES(?)",
-        (chat_id,)
-    )
+            return
 
-    db.commit()
+    # =====================================================
+    # NORMAL START
+    # =====================================================
 
     await update.message.reply_text(
         "✅ You are subscribed.\n\n"
@@ -148,22 +223,43 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =========================================================
-# 5. SEND VIDEO PACK
+# 6. SEND VIDEO PACK
 # =========================================================
 
-async def send_pack(update, context, pack_id):
+async def send_pack(
+    update,
+    context,
+    pack_id
+):
 
     chat_id = update.effective_chat.id
 
-    items = db.execute(
-        """
-        SELECT source_chat_id, source_message_id
-        FROM pack_items
-        WHERE pack_id=?
-        ORDER BY id ASC
-        """,
-        (pack_id,)
-    ).fetchall()
+    try:
+
+        with get_db() as conn:
+
+            items = conn.execute(
+                """
+                SELECT source_chat_id, source_message_id
+                FROM pack_items
+                WHERE pack_id=%s
+                ORDER BY id ASC
+                """,
+                (pack_id,)
+            ).fetchall()
+
+    except Exception as e:
+
+        logger.error(
+            "Pack items database error: %s",
+            e
+        )
+
+        await update.message.reply_text(
+            "❌ Database error."
+        )
+
+        return
 
     if not items:
 
@@ -173,34 +269,59 @@ async def send_pack(update, context, pack_id):
 
         return
 
+    # =====================================================
+    # WARNING MESSAGE
+    # =====================================================
+
     warning = await update.message.reply_text(
         "🔥 নতুন ভিডিওগুলো এখনই দেখে নিন!\n\n"
         "⚠️ ভিডিওগুলো ১ ঘণ্টা পরে অটো ডিলিট হয়ে যাবে।"
     )
 
-    delete_at = int(time.time()) + PACK_DELETE_AFTER
-
-    db.execute(
-        """
-        INSERT INTO pack_messages(
-            chat_id,
-            message_id,
-            delete_at
-        )
-        VALUES(?, ?, ?)
-        """,
-        (
-            chat_id,
-            warning.message_id,
-            delete_at
-        )
+    delete_at = (
+        int(time.time())
+        + PACK_DELETE_AFTER
     )
 
-    db.commit()
+    try:
+
+        with get_db() as conn:
+
+            conn.execute(
+                """
+                INSERT INTO pack_messages(
+                    chat_id,
+                    message_id,
+                    delete_at
+                )
+                VALUES(%s, %s, %s)
+                """,
+                (
+                    chat_id,
+                    warning.message_id,
+                    delete_at
+                )
+            )
+
+            conn.commit()
+
+    except Exception as e:
+
+        logger.error(
+            "Warning save error: %s",
+            e
+        )
 
     sent = 0
 
-    for source_chat_id, source_message_id in items:
+    # =====================================================
+    # SEND PACK ITEMS
+    # =====================================================
+
+    for item in items:
+
+        source_chat_id = item["source_chat_id"]
+        source_message_id = item["source_message_id"]
 
         try:
 
@@ -210,28 +331,40 @@ async def send_pack(update, context, pack_id):
                 message_id=source_message_id
             )
 
-            db.execute(
-                """
-                INSERT INTO pack_messages(
-                    chat_id,
-                    message_id,
-                    delete_at
-                )
-                VALUES(?, ?, ?)
-                """,
-                (
-                    chat_id,
-                    copied.message_id,
-                    delete_at
-                )
-            )
+            try:
 
-            db.commit()
+                with get_db() as conn:
+
+                    conn.execute(
+                        """
+                        INSERT INTO pack_messages(
+                            chat_id,
+                            message_id,
+                            delete_at
+                        )
+                        VALUES(%s, %s, %s)
+                        """,
+                        (
+                            chat_id,
+                            copied.message_id,
+                            delete_at
+                        )
+                    )
+
+                    conn.commit()
+
+            except Exception as e:
+
+                logger.error(
+                    "Pack message DB error: %s",
+                    e
+                )
 
             sent += 1
 
-            # Same delay as your existing system
-            await asyncio.sleep(SEND_DELAY)
+            await asyncio.sleep(
+                SEND_DELAY
+            )
 
         except RetryAfter as e:
 
@@ -247,23 +380,34 @@ async def send_pack(update, context, pack_id):
                     message_id=source_message_id
                 )
 
-                db.execute(
-                    """
-                    INSERT INTO pack_messages(
-                        chat_id,
-                        message_id,
-                        delete_at
-                    )
-                    VALUES(?, ?, ?)
-                    """,
-                    (
-                        chat_id,
-                        copied.message_id,
-                        delete_at
-                    )
-                )
+                try:
 
-                db.commit()
+                    with get_db() as conn:
+
+                        conn.execute(
+                            """
+                            INSERT INTO pack_messages(
+                                chat_id,
+                                message_id,
+                                delete_at
+                            )
+                            VALUES(%s, %s, %s)
+                            """,
+                            (
+                                chat_id,
+                                copied.message_id,
+                                delete_at
+                            )
+                        )
+
+                        conn.commit()
+
+                except Exception as e:
+
+                    logger.error(
+                        "Retry DB error: %s",
+                        e
+                    )
 
                 sent += 1
 
@@ -289,19 +433,39 @@ async def send_pack(update, context, pack_id):
 
 
 # =========================================================
-# 6. /STOP
+# 7. /STOP
 # =========================================================
 
-async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def stop(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     chat_id = update.effective_chat.id
 
-    db.execute(
-        "DELETE FROM users WHERE chat_id=?",
-        (chat_id,)
-    )
+    try:
 
-    db.commit()
+        with get_db() as conn:
+
+            conn.execute(
+                "DELETE FROM users WHERE chat_id=%s",
+                (chat_id,)
+            )
+
+            conn.commit()
+
+    except Exception as e:
+
+        logger.error(
+            "Stop database error: %s",
+            e
+        )
+
+        await update.message.reply_text(
+            "❌ Database error."
+        )
+
+        return
 
     await update.message.reply_text(
         "❌ Broadcast stopped.\n\n"
@@ -310,7 +474,7 @@ async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =========================================================
-# 7. DELETE OLD BROADCAST + PACK MESSAGES
+# 8. DELETE OLD MESSAGES
 # =========================================================
 
 async def delete_old_messages(app):
@@ -321,53 +485,26 @@ async def delete_old_messages(app):
 
             now = int(time.time())
 
-            # -----------------------------------------
-            # Normal broadcast messages
-            # -----------------------------------------
+            # =================================================
+            # NORMAL BROADCAST
+            # =================================================
 
-            rows = db.execute(
-                """
-                SELECT id, chat_id, message_id
-                FROM messages
-                WHERE delete_at <= ?
-                """,
-                (now,)
-            ).fetchall()
+            with get_db() as conn:
 
-            for row_id, chat_id, message_id in rows:
+                rows = conn.execute(
+                    """
+                    SELECT id, chat_id, message_id
+                    FROM messages
+                    WHERE delete_at <= %s
+                    """,
+                    (now,)
+                ).fetchall()
 
-                try:
+            for row in rows:
 
-                    await app.bot.delete_message(
-                        chat_id=chat_id,
-                        message_id=message_id
-                    )
-
-                except TelegramError:
-                    pass
-
-                db.execute(
-                    "DELETE FROM messages WHERE id=?",
-                    (row_id,)
-                )
-
-            db.commit()
-
-
-            # -----------------------------------------
-            # Video pack messages
-            # -----------------------------------------
-
-            pack_rows = db.execute(
-                """
-                SELECT id, chat_id, message_id
-                FROM pack_messages
-                WHERE delete_at <= ?
-                """,
-                (now,)
-            ).fetchall()
-
-            for row_id, chat_id, message_id in pack_rows:
+                row_id = row["id"]
+                chat_id = row["chat_id"]
+                message_id = row["message_id"]
 
                 try:
 
@@ -379,12 +516,78 @@ async def delete_old_messages(app):
                 except TelegramError:
                     pass
 
-                db.execute(
-                    "DELETE FROM pack_messages WHERE id=?",
-                    (row_id,)
-                )
+                try:
 
-            db.commit()
+                    with get_db() as conn:
+
+                        conn.execute(
+                            """
+                            DELETE FROM messages
+                            WHERE id=%s
+                            """,
+                            (row_id,)
+                        )
+
+                        conn.commit()
+
+                except Exception as e:
+
+                    logger.error(
+                        "Message DB delete error: %s",
+                        e
+                    )
+
+            # =================================================
+            # PACK MESSAGES
+            # =================================================
+
+            with get_db() as conn:
+
+                pack_rows = conn.execute(
+                    """
+                    SELECT id, chat_id, message_id
+                    FROM pack_messages
+                    WHERE delete_at <= %s
+                    """,
+                    (now,)
+                ).fetchall()
+
+            for row in pack_rows:
+
+                row_id = row["id"]
+                chat_id = row["chat_id"]
+                message_id = row["message_id"]
+
+                try:
+
+                    await app.bot.delete_message(
+                        chat_id=chat_id,
+                        message_id=message_id
+                    )
+
+                except TelegramError:
+                    pass
+
+                try:
+
+                    with get_db() as conn:
+
+                        conn.execute(
+                            """
+                            DELETE FROM pack_messages
+                            WHERE id=%s
+                            """,
+                            (row_id,)
+                        )
+
+                        conn.commit()
+
+                except Exception as e:
+
+                    logger.error(
+                        "Pack DB delete error: %s",
+                        e
+                    )
 
         except Exception as e:
 
@@ -397,10 +600,13 @@ async def delete_old_messages(app):
 
 
 # =========================================================
-# 8. /NEWPACK
+# 9. /NEWPACK
 # =========================================================
 
-async def newpack(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def newpack(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     if update.effective_user.id != ADMIN_ID:
 
@@ -424,7 +630,7 @@ async def newpack(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =========================================================
-# 9. ADMIN ADDS VIDEO/MESSAGE TO PACK
+# 10. COLLECT PACK ITEM
 # =========================================================
 
 async def collect_pack_item(
@@ -448,7 +654,6 @@ async def collect_pack_item(
         []
     )
 
-    # Save admin's message as pack item
     items.append(
         (
             update.effective_chat.id,
@@ -465,10 +670,13 @@ async def collect_pack_item(
 
 
 # =========================================================
-# 10. /DONE
+# 11. /DONE
 # =========================================================
 
-async def done(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def done(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     if update.effective_user.id != ADMIN_ID:
 
@@ -502,51 +710,76 @@ async def done(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         return
 
-    # Generate unique pack code
+    # =====================================================
+    # UNIQUE PACK CODE
+    # =====================================================
+
     pack_code = (
         "pack_"
-        + str(int(time.time()))
+        + str(int(time.time() * 1000))
     )
 
     now = int(time.time())
 
-    cursor = db.execute(
-        """
-        INSERT INTO packs(
-            pack_code,
-            created_at
-        )
-        VALUES(?, ?)
-        """,
-        (
-            pack_code,
-            now
-        )
-    )
+    try:
 
-    pack_id = cursor.lastrowid
+        with get_db() as conn:
 
-    for source_chat_id, source_message_id in items:
-
-        db.execute(
-            """
-            INSERT INTO pack_items(
-                pack_id,
-                source_chat_id,
-                source_message_id
+            cursor = conn.execute(
+                """
+                INSERT INTO packs(
+                    pack_code,
+                    created_at
+                )
+                VALUES(%s, %s)
+                RETURNING id
+                """,
+                (
+                    pack_code,
+                    now
+                )
             )
-            VALUES(?, ?, ?)
-            """,
-            (
-                pack_id,
-                source_chat_id,
-                source_message_id
-            )
+
+            pack_id = cursor.fetchone()["id"]
+
+            for source_chat_id, source_message_id in items:
+
+                conn.execute(
+                    """
+                    INSERT INTO pack_items(
+                        pack_id,
+                        source_chat_id,
+                        source_message_id
+                    )
+                    VALUES(%s, %s, %s)
+                    """,
+                    (
+                        pack_id,
+                        source_chat_id,
+                        source_message_id
+                    )
+                )
+
+            conn.commit()
+
+    except Exception as e:
+
+        logger.error(
+            "Pack creation error: %s",
+            e
         )
 
-    db.commit()
+        await update.message.reply_text(
+            "❌ Pack তৈরি করতে Database Error হয়েছে.\n\n"
+            f"Error: {type(e).__name__}"
+        )
 
-    # Clear temporary data
+        return
+
+    # =====================================================
+    # CLEAR TEMP DATA
+    # =====================================================
+
     context.user_data.pop(
         "creating_pack",
         None
@@ -578,7 +811,7 @@ async def done(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =========================================================
-# 11. /CANCELPACK
+# 12. /CANCELPACK
 # =========================================================
 
 async def cancelpack(
@@ -605,7 +838,7 @@ async def cancelpack(
 
 
 # =========================================================
-# 12. BROADCAST
+# 13. BROADCAST
 # =========================================================
 
 async def broadcast(
@@ -614,10 +847,9 @@ async def broadcast(
 ):
 
     if update.effective_user.id != ADMIN_ID:
-
         return
 
-    # Don't broadcast while creating a pack
+    # If creating pack, collect the message
     if context.user_data.get(
         "creating_pack",
         False
@@ -630,9 +862,26 @@ async def broadcast(
 
         return
 
-    users = db.execute(
-        "SELECT chat_id FROM users"
-    ).fetchall()
+    try:
+
+        with get_db() as conn:
+
+            users = conn.execute(
+                "SELECT chat_id FROM users"
+            ).fetchall()
+
+    except Exception as e:
+
+        logger.error(
+            "Broadcast DB error: %s",
+            e
+        )
+
+        await update.message.reply_text(
+            "❌ Database error."
+        )
+
+        return
 
     if not users:
 
@@ -649,7 +898,9 @@ async def broadcast(
         f"📢 Broadcasting to {len(users)} users..."
     )
 
-    for (chat_id,) in users:
+    for user in users:
+
+        chat_id = user["chat_id"]
 
         try:
 
@@ -664,23 +915,25 @@ async def broadcast(
                 + DELETE_AFTER
             )
 
-            db.execute(
-                """
-                INSERT INTO messages(
-                    chat_id,
-                    message_id,
-                    delete_at
-                )
-                VALUES(?, ?, ?)
-                """,
-                (
-                    chat_id,
-                    copied.message_id,
-                    delete_at
-                )
-            )
+            with get_db() as conn:
 
-            db.commit()
+                conn.execute(
+                    """
+                    INSERT INTO messages(
+                        chat_id,
+                        message_id,
+                        delete_at
+                    )
+                    VALUES(%s, %s, %s)
+                    """,
+                    (
+                        chat_id,
+                        copied.message_id,
+                        delete_at
+                    )
+                )
+
+                conn.commit()
 
             sent += 1
 
@@ -707,23 +960,25 @@ async def broadcast(
                     + DELETE_AFTER
                 )
 
-                db.execute(
-                    """
-                    INSERT INTO messages(
-                        chat_id,
-                        message_id,
-                        delete_at
-                    )
-                    VALUES(?, ?, ?)
-                    """,
-                    (
-                        chat_id,
-                        copied.message_id,
-                        delete_at
-                    )
-                )
+                with get_db() as conn:
 
-                db.commit()
+                    conn.execute(
+                        """
+                        INSERT INTO messages(
+                            chat_id,
+                            message_id,
+                            delete_at
+                        )
+                        VALUES(%s, %s, %s)
+                        """,
+                        (
+                            chat_id,
+                            copied.message_id,
+                            delete_at
+                        )
+                    )
+
+                    conn.commit()
 
                 sent += 1
 
@@ -733,12 +988,19 @@ async def broadcast(
 
         except Forbidden:
 
-            db.execute(
-                "DELETE FROM users WHERE chat_id=?",
-                (chat_id,)
-            )
+            try:
 
-            db.commit()
+                with get_db() as conn:
+
+                    conn.execute(
+                        "DELETE FROM users WHERE chat_id=%s",
+                        (chat_id,)
+                    )
+
+                    conn.commit()
+
+            except Exception:
+                pass
 
             failed += 1
 
@@ -759,7 +1021,7 @@ async def broadcast(
 
 
 # =========================================================
-# 13. ADMIN
+# 14. /ADMIN
 # =========================================================
 
 async def admin(
@@ -775,9 +1037,28 @@ async def admin(
 
         return
 
-    count = db.execute(
-        "SELECT COUNT(*) FROM users"
-    ).fetchone()[0]
+    try:
+
+        with get_db() as conn:
+
+            result = conn.execute(
+                "SELECT COUNT(*) AS total FROM users"
+            ).fetchone()
+
+            count = result["total"]
+
+    except Exception as e:
+
+        logger.error(
+            "Admin DB error: %s",
+            e
+        )
+
+        await update.message.reply_text(
+            "❌ Database error."
+        )
+
+        return
 
     await update.message.reply_text(
         "👑 Admin Panel\n\n"
@@ -797,10 +1078,20 @@ async def admin(
 
 
 # =========================================================
-# 14. MAIN
+# 15. MAIN
 # =========================================================
 
 async def main():
+
+    # =====================================================
+    # DATABASE FIRST
+    # =====================================================
+
+    init_database()
+
+    # =====================================================
+    # CREATE BOT
+    # =====================================================
 
     app = (
         Application.builder()
@@ -808,7 +1099,10 @@ async def main():
         .build()
     )
 
-    # User commands
+    # =====================================================
+    # USER COMMANDS
+    # =====================================================
+
     app.add_handler(
         CommandHandler(
             "start",
@@ -823,7 +1117,10 @@ async def main():
         )
     )
 
-    # Admin commands
+    # =====================================================
+    # ADMIN COMMANDS
+    # =====================================================
+
     app.add_handler(
         CommandHandler(
             "admin",
@@ -852,7 +1149,10 @@ async def main():
         )
     )
 
-    # Admin messages
+    # =====================================================
+    # ADMIN MESSAGES
+    # =====================================================
+
     app.add_handler(
         MessageHandler(
             filters.ALL & ~filters.COMMAND,
@@ -860,12 +1160,16 @@ async def main():
         )
     )
 
-    # Delete worker
+    # =====================================================
+    # DELETE WORKER
+    # =====================================================
+
     asyncio.create_task(
         delete_old_messages(app)
     )
 
     print("==============================")
+    print("DATABASE READY")
     print("BOT IS RUNNING")
     print("==============================")
 
@@ -889,7 +1193,7 @@ async def main():
 
 
 # =========================================================
-# START BOT
+# START
 # =========================================================
 
 asyncio.run(main())
