@@ -120,12 +120,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ).fetchone()
 
         if pack:
-            await send_pack(
-                update,
-                context,
-                pack[0]
-            )
-            return
+    db.execute(
+        "INSERT OR IGNORE INTO users(chat_id) VALUES(?)",
+        (chat_id,)
+    )
+    db.commit()
+
+    await send_pack(
+        update,
+        context,
+        pack[0]
+    )
+    return
 
     # Normal subscription
     db.execute(
