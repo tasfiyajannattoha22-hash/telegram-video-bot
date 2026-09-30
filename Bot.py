@@ -6,12 +6,17 @@ import logging
 import psycopg
 from psycopg.rows import dict_row
 
-from telegram import Update
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 from telegram.error import TelegramError, RetryAfter, Forbidden
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
@@ -26,14 +31,15 @@ ADMIN_ID = 7105146175
 
 DATABASE_URL = os.environ["DATABASE_URL"]
 
-# Existing broadcast messages
 DELETE_AFTER = 24 * 60 * 60
-
-# Video pack messages
 PACK_DELETE_AFTER = 60 * 60
-
-# Broadcast delay
 SEND_DELAY = 0.06
+
+# Subscriber list
+USERS_PER_PAGE = 10
+
+# "Old packs" means packs older than this many days
+OLD_PACK_DAYS = 7
 
 
 # =========================================================
@@ -49,7 +55,7 @@ logger = logging.getLogger(__name__)
 
 
 # =========================================================
-# 3. DATABASE CONNECTION
+# 3. DATABASE
 # =========================================================
 
 def get_db():
@@ -60,21 +66,40 @@ def get_db():
 
 
 # =========================================================
-# 4. DATABASE SETUP
+# 4. DATABASE SETUP + MIGRATION
 # =========================================================
 
 def init_database():
 
     with get_db() as conn:
 
-        # Users / subscribers
+        # -------------------------------------------------
+        # USERS
+        # -------------------------------------------------
+
         conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 chat_id BIGINT PRIMARY KEY
             )
         """)
 
-        # Normal broadcast messages
+        # Add created_at to existing users table
+        conn.execute("""
+            ALTER TABLE users
+            ADD COLUMN IF NOT EXISTS created_at BIGINT
+        """)
+
+        # Existing users get current time if created_at is NULL
+        conn.execute("""
+            UPDATE users
+            SET created_at = EXTRACT(EPOCH FROM NOW())::BIGINT
+            WHERE created_at IS NULL
+        """)
+
+        # -------------------------------------------------
+        # NORMAL BROADCAST MESSAGES
+        # -------------------------------------------------
+
         conn.execute("""
             CREATE TABLE IF NOT EXISTS messages (
                 id BIGSERIAL PRIMARY KEY,
@@ -84,7 +109,10 @@ def init_database():
             )
         """)
 
-        # Video packs
+        # -------------------------------------------------
+        # VIDEO PACKS
+        # -------------------------------------------------
+
         conn.execute("""
             CREATE TABLE IF NOT EXISTS packs (
                 id BIGSERIAL PRIMARY KEY,
@@ -93,7 +121,10 @@ def init_database():
             )
         """)
 
-        # Messages inside packs
+        # -------------------------------------------------
+        # PACK ITEMS
+        # -------------------------------------------------
+
         conn.execute("""
             CREATE TABLE IF NOT EXISTS pack_items (
                 id BIGSERIAL PRIMARY KEY,
@@ -103,7 +134,10 @@ def init_database():
             )
         """)
 
-        # Pack messages sent to users
+        # -------------------------------------------------
+        # PACK MESSAGES SENT TO USERS
+        # -------------------------------------------------
+
         conn.execute("""
             CREATE TABLE IF NOT EXISTS pack_messages (
                 id BIGSERIAL PRIMARY KEY,
@@ -113,13 +147,158 @@ def init_database():
             )
         """)
 
+        # -------------------------------------------------
+        # BROADCAST STATISTICS
+        # -------------------------------------------------
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS broadcast_stats (
+                id BIGSERIAL PRIMARY KEY,
+                created_at BIGINT NOT NULL,
+                sent_count BIGINT NOT NULL DEFAULT 0,
+                failed_count BIGINT NOT NULL DEFAULT 0
+            )
+        """)
+
         conn.commit()
 
     logger.info("DATABASE READY")
 
 
 # =========================================================
-# 5. /START
+# 5. ADMIN KEYBOARD
+# =========================================================
+
+def admin_keyboard():
+
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "🎬 Create Pack",
+                callback_data="create_pack"
+            ),
+            InlineKeyboardButton(
+                "📢 Broadcast",
+                callback_data="broadcast"
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "👤 Subscribers",
+                callback_data="subscribers_0"
+            ),
+            InlineKeyboardButton(
+                "📊 Statistics",
+                callback_data="statistics"
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "🗑️ Delete Old Packs",
+                callback_data="delete_old_packs"
+            ),
+            InlineKeyboardButton(
+                "🔄 Refresh",
+                callback_data="refresh_admin"
+            ),
+        ],
+    ]
+
+    return InlineKeyboardMarkup(keyboard)
+
+
+# =========================================================
+# 6. ADMIN DASHBOARD TEXT
+# =========================================================
+
+def dashboard_text(
+    total_users,
+    active_users,
+    total_packs,
+    total_broadcasts,
+    new_today
+):
+
+    return (
+        "👑 ADMIN DASHBOARD\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+
+        "📊 STATISTICS\n\n"
+
+        f"👥 Total Subscribers: {total_users}\n"
+        f"🟢 Active Subscribers: {active_users}\n"
+        f"📦 Total Packs: {total_packs}\n"
+        f"📤 Total Broadcasts: {total_broadcasts}\n"
+        f"📈 New Today: +{new_today}\n\n"
+
+        "━━━━━━━━━━━━━━━━━━\n\n"
+
+        "Choose an option below 👇"
+    )
+
+
+# =========================================================
+# 7. GET DASHBOARD
+# =========================================================
+
+def get_dashboard_data():
+
+    with get_db() as conn:
+
+        total_users = conn.execute(
+            """
+            SELECT COUNT(*) AS total
+            FROM users
+            """
+        ).fetchone()["total"]
+
+        # Active = currently subscribed users
+        active_users = total_users
+
+        total_packs = conn.execute(
+            """
+            SELECT COUNT(*) AS total
+            FROM packs
+            """
+        ).fetchone()["total"]
+
+        total_broadcasts = conn.execute(
+            """
+            SELECT COUNT(*) AS total
+            FROM broadcast_stats
+            """
+        ).fetchone()["total"]
+
+        day_start = int(
+            time.time()
+            - (
+                time.time()
+                % 86400
+            )
+        )
+
+        # Use UTC date boundary from PostgreSQL
+        new_today = conn.execute(
+            """
+            SELECT COUNT(*) AS total
+            FROM users
+            WHERE created_at >= EXTRACT(
+                EPOCH FROM CURRENT_DATE
+            )::BIGINT
+            """
+        ).fetchone()["total"]
+
+    return (
+        total_users,
+        active_users,
+        total_packs,
+        total_broadcasts,
+        new_today
+    )
+
+
+# =========================================================
+# 8. /START
 # =========================================================
 
 async def start(
@@ -127,11 +306,14 @@ async def start(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
+    if not update.message:
+        return
+
     chat_id = update.effective_chat.id
 
-    # =====================================================
+    # -------------------------------------------------
     # AUTO SUBSCRIBE
-    # =====================================================
+    # -------------------------------------------------
 
     try:
 
@@ -139,11 +321,17 @@ async def start(
 
             conn.execute(
                 """
-                INSERT INTO users(chat_id)
-                VALUES(%s)
+                INSERT INTO users(
+                    chat_id,
+                    created_at
+                )
+                VALUES(%s, %s)
                 ON CONFLICT (chat_id) DO NOTHING
                 """,
-                (chat_id,)
+                (
+                    chat_id,
+                    int(time.time())
+                )
             )
 
             conn.commit()
@@ -166,9 +354,9 @@ async def start(
 
         return
 
-    # =====================================================
+    # -------------------------------------------------
     # PACK DEEP LINK
-    # =====================================================
+    # -------------------------------------------------
 
     args = context.args
 
@@ -212,9 +400,9 @@ async def start(
 
             return
 
-    # =====================================================
+    # -------------------------------------------------
     # NORMAL START
-    # =====================================================
+    # -------------------------------------------------
 
     await update.message.reply_text(
         "✅ You are subscribed.\n\n"
@@ -223,7 +411,7 @@ async def start(
 
 
 # =========================================================
-# 6. SEND VIDEO PACK
+# 9. SEND VIDEO PACK
 # =========================================================
 
 async def send_pack(
@@ -240,7 +428,9 @@ async def send_pack(
 
             items = conn.execute(
                 """
-                SELECT source_chat_id, source_message_id
+                SELECT
+                    source_chat_id,
+                    source_message_id
                 FROM pack_items
                 WHERE pack_id=%s
                 ORDER BY id ASC
@@ -269,9 +459,9 @@ async def send_pack(
 
         return
 
-    # =====================================================
-    # WARNING MESSAGE
-    # =====================================================
+    # -------------------------------------------------
+    # WARNING
+    # -------------------------------------------------
 
     warning = await update.message.reply_text(
         "🔥 নতুন ভিডিওগুলো এখনই দেখে নিন!\n\n"
@@ -314,9 +504,9 @@ async def send_pack(
 
     sent = 0
 
-    # =====================================================
-    # SEND PACK ITEMS
-    # =====================================================
+    # -------------------------------------------------
+    # SEND ITEMS
+    # -------------------------------------------------
 
     for item in items:
 
@@ -433,7 +623,7 @@ async def send_pack(
 
 
 # =========================================================
-# 7. /STOP
+# 10. /STOP
 # =========================================================
 
 async def stop(
@@ -448,7 +638,10 @@ async def stop(
         with get_db() as conn:
 
             conn.execute(
-                "DELETE FROM users WHERE chat_id=%s",
+                """
+                DELETE FROM users
+                WHERE chat_id=%s
+                """,
                 (chat_id,)
             )
 
@@ -474,7 +667,7 @@ async def stop(
 
 
 # =========================================================
-# 8. DELETE OLD MESSAGES
+# 11. DELETE OLD MESSAGES
 # =========================================================
 
 async def delete_old_messages(app):
@@ -485,9 +678,9 @@ async def delete_old_messages(app):
 
             now = int(time.time())
 
-            # =================================================
+            # -------------------------------------------------
             # NORMAL BROADCAST
-            # =================================================
+            # -------------------------------------------------
 
             with get_db() as conn:
 
@@ -502,15 +695,11 @@ async def delete_old_messages(app):
 
             for row in rows:
 
-                row_id = row["id"]
-                chat_id = row["chat_id"]
-                message_id = row["message_id"]
-
                 try:
 
                     await app.bot.delete_message(
-                        chat_id=chat_id,
-                        message_id=message_id
+                        chat_id=row["chat_id"],
+                        message_id=row["message_id"]
                     )
 
                 except TelegramError:
@@ -525,7 +714,7 @@ async def delete_old_messages(app):
                             DELETE FROM messages
                             WHERE id=%s
                             """,
-                            (row_id,)
+                            (row["id"],)
                         )
 
                         conn.commit()
@@ -537,9 +726,9 @@ async def delete_old_messages(app):
                         e
                     )
 
-            # =================================================
+            # -------------------------------------------------
             # PACK MESSAGES
-            # =================================================
+            # -------------------------------------------------
 
             with get_db() as conn:
 
@@ -554,15 +743,11 @@ async def delete_old_messages(app):
 
             for row in pack_rows:
 
-                row_id = row["id"]
-                chat_id = row["chat_id"]
-                message_id = row["message_id"]
-
                 try:
 
                     await app.bot.delete_message(
-                        chat_id=chat_id,
-                        message_id=message_id
+                        chat_id=row["chat_id"],
+                        message_id=row["message_id"]
                     )
 
                 except TelegramError:
@@ -577,7 +762,7 @@ async def delete_old_messages(app):
                             DELETE FROM pack_messages
                             WHERE id=%s
                             """,
-                            (row_id,)
+                            (row["id"],)
                         )
 
                         conn.commit()
@@ -600,7 +785,7 @@ async def delete_old_messages(app):
 
 
 # =========================================================
-# 9. /NEWPACK
+# 12. CREATE NEW PACK
 # =========================================================
 
 async def newpack(
@@ -618,19 +803,18 @@ async def newpack(
 
     context.user_data["creating_pack"] = True
     context.user_data["pack_items"] = []
+    context.user_data["broadcast_mode"] = False
 
     await update.message.reply_text(
-        "🎬 New Video Pack Started!\n\n"
-        "এখন একে একে যতগুলো video/message চাইবে পাঠাও।\n\n"
-        "সব শেষ হলে লিখো:\n"
-        "/done\n\n"
-        "বাতিল করতে:\n"
-        "/cancelpack"
+        "🎬 NEW VIDEO PACK\n\n"
+        "এখন একে একে video/message পাঠাও।\n\n"
+        "শেষ হলে /done লিখো।\n\n"
+        "বাতিল করতে /cancelpack"
     )
 
 
 # =========================================================
-# 10. COLLECT PACK ITEM
+# 13. COLLECT PACK ITEM
 # =========================================================
 
 async def collect_pack_item(
@@ -670,7 +854,7 @@ async def collect_pack_item(
 
 
 # =========================================================
-# 11. /DONE
+# 14. /DONE
 # =========================================================
 
 async def done(
@@ -709,10 +893,6 @@ async def done(
         )
 
         return
-
-    # =====================================================
-    # UNIQUE PACK CODE
-    # =====================================================
 
     pack_code = (
         "pack_"
@@ -776,10 +956,6 @@ async def done(
 
         return
 
-    # =====================================================
-    # CLEAR TEMP DATA
-    # =====================================================
-
     context.user_data.pop(
         "creating_pack",
         None
@@ -791,8 +967,8 @@ async def done(
     )
 
     bot_username = (
-        (await context.bot.get_me()).username
-    )
+        await context.bot.get_me()
+    ).username
 
     deep_link = (
         f"https://t.me/{bot_username}"
@@ -811,7 +987,7 @@ async def done(
 
 
 # =========================================================
-# 12. /CANCELPACK
+# 15. /CANCELPACK
 # =========================================================
 
 async def cancelpack(
@@ -838,7 +1014,7 @@ async def cancelpack(
 
 
 # =========================================================
-# 13. BROADCAST
+# 16. BROADCAST
 # =========================================================
 
 async def broadcast(
@@ -849,7 +1025,10 @@ async def broadcast(
     if update.effective_user.id != ADMIN_ID:
         return
 
-    # If creating pack, collect the message
+    # -------------------------------------------------
+    # PACK MODE
+    # -------------------------------------------------
+
     if context.user_data.get(
         "creating_pack",
         False
@@ -862,12 +1041,27 @@ async def broadcast(
 
         return
 
+    # -------------------------------------------------
+    # BROADCAST MODE
+    # -------------------------------------------------
+
+    if not context.user_data.get(
+        "broadcast_mode",
+        False
+    ):
+        return
+
+    context.user_data["broadcast_mode"] = False
+
     try:
 
         with get_db() as conn:
 
             users = conn.execute(
-                "SELECT chat_id FROM users"
+                """
+                SELECT chat_id
+                FROM users
+                """
             ).fetchall()
 
     except Exception as e:
@@ -886,7 +1080,7 @@ async def broadcast(
     if not users:
 
         await update.message.reply_text(
-            "⚠️ No users have started the bot yet."
+            "⚠️ No subscribers."
         )
 
         return
@@ -894,8 +1088,8 @@ async def broadcast(
     sent = 0
     failed = 0
 
-    await update.message.reply_text(
-        f"📢 Broadcasting to {len(users)} users..."
+    progress = await update.message.reply_text(
+        f"📢 Broadcasting to {len(users)} subscribers..."
     )
 
     for user in users:
@@ -993,7 +1187,10 @@ async def broadcast(
                 with get_db() as conn:
 
                     conn.execute(
-                        "DELETE FROM users WHERE chat_id=%s",
+                        """
+                        DELETE FROM users
+                        WHERE chat_id=%s
+                        """,
                         (chat_id,)
                     )
 
@@ -1012,16 +1209,109 @@ async def broadcast(
 
             failed += 1
 
-    await update.message.reply_text(
-        "✅ Broadcast finished!\n\n"
-        f"📤 Sent: {sent}\n"
-        f"❌ Failed: {failed}\n\n"
-        "🗑 Messages will be deleted after 24 hours."
-    )
+    # -------------------------------------------------
+    # SAVE BROADCAST STATISTICS
+    # -------------------------------------------------
+
+    try:
+
+        with get_db() as conn:
+
+            conn.execute(
+                """
+                INSERT INTO broadcast_stats(
+                    created_at,
+                    sent_count,
+                    failed_count
+                )
+                VALUES(%s, %s, %s)
+                """,
+                (
+                    int(time.time()),
+                    sent,
+                    failed
+                )
+            )
+
+            conn.commit()
+
+    except Exception as e:
+
+        logger.error(
+            "Broadcast stats error: %s",
+            e
+        )
+
+    try:
+
+        await progress.edit_text(
+            "✅ BROADCAST FINISHED!\n\n"
+            f"📤 Sent: {sent}\n"
+            f"❌ Failed: {failed}\n\n"
+            "🗑️ Messages will be deleted after 24 hours."
+        )
+
+    except Exception:
+        pass
 
 
 # =========================================================
-# 14. /ADMIN
+# 17. SHOW ADMIN PANEL
+# =========================================================
+
+async def show_admin(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    edit=False
+):
+
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    try:
+
+        data = get_dashboard_data()
+
+        text = dashboard_text(*data)
+
+        keyboard = admin_keyboard()
+
+        if edit:
+
+            await update.callback_query.edit_message_text(
+                text=text,
+                reply_markup=keyboard
+            )
+
+        else:
+
+            await update.message.reply_text(
+                text=text,
+                reply_markup=keyboard
+            )
+
+    except Exception as e:
+
+        logger.error(
+            "Dashboard error: %s",
+            e
+        )
+
+        if edit:
+
+            await update.callback_query.edit_message_text(
+                "❌ Database error."
+            )
+
+        else:
+
+            await update.message.reply_text(
+                "❌ Database error."
+            )
+
+
+# =========================================================
+# 18. /ADMIN
 # =========================================================
 
 async def admin(
@@ -1037,61 +1327,518 @@ async def admin(
 
         return
 
+    context.user_data["broadcast_mode"] = False
+
+    await show_admin(
+        update,
+        context,
+        edit=False
+    )
+
+
+# =========================================================
+# 19. SUBSCRIBER LIST
+# =========================================================
+
+async def show_subscribers(
+    query,
+    page=0
+):
+
     try:
 
         with get_db() as conn:
 
-            result = conn.execute(
-                "SELECT COUNT(*) AS total FROM users"
-            ).fetchone()
+            total = conn.execute(
+                """
+                SELECT COUNT(*) AS total
+                FROM users
+                """
+            ).fetchone()["total"]
 
-            count = result["total"]
+            offset = page * USERS_PER_PAGE
+
+            users = conn.execute(
+                """
+                SELECT chat_id, created_at
+                FROM users
+                ORDER BY created_at DESC
+                LIMIT %s OFFSET %s
+                """,
+                (
+                    USERS_PER_PAGE,
+                    offset
+                )
+            ).fetchall()
 
     except Exception as e:
 
         logger.error(
-            "Admin DB error: %s",
+            "Subscriber list error: %s",
             e
         )
 
-        await update.message.reply_text(
+        await query.edit_message_text(
             "❌ Database error."
         )
 
         return
 
-    await update.message.reply_text(
-        "👑 Admin Panel\n\n"
-        f"👥 Subscribers: {count}\n\n"
+    if total == 0:
 
-        "📢 Normal Broadcast:\n"
-        "Send any video/photo/text/link.\n\n"
+        await query.edit_message_text(
+            "👤 SUBSCRIBERS\n\n"
+            "No subscribers yet.",
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "🔙 Back",
+                        callback_data="back_admin"
+                    )
+                ]
+            ])
+        )
 
-        "🎬 Video Pack:\n"
-        "/newpack\n"
-        "→ Send videos\n"
-        "→ /done\n\n"
+        return
 
-        "❌ Cancel pack:\n"
-        "/cancelpack"
+    total_pages = (
+        total + USERS_PER_PAGE - 1
+    ) // USERS_PER_PAGE
+
+    text = (
+        "👤 SUBSCRIBERS\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        f"Total: {total}\n\n"
+    )
+
+    for index, user in enumerate(
+        users,
+        start=offset + 1
+    ):
+
+        chat_id = user["chat_id"]
+
+        text += (
+            f"{index}. 👤 `{chat_id}`\n"
+        )
+
+    text += (
+        "\n━━━━━━━━━━━━━━━━━━\n"
+        f"Page {page + 1}/{total_pages}"
+    )
+
+    buttons = []
+
+    navigation = []
+
+    if page > 0:
+
+        navigation.append(
+            InlineKeyboardButton(
+                "◀️ Previous",
+                callback_data=f"subscribers_{page - 1}"
+            )
+        )
+
+    if page < total_pages - 1:
+
+        navigation.append(
+            InlineKeyboardButton(
+                "Next ▶️",
+                callback_data=f"subscribers_{page + 1}"
+            )
+        )
+
+    if navigation:
+        buttons.append(navigation)
+
+    buttons.append([
+        InlineKeyboardButton(
+            "🔄 Refresh",
+            callback_data=f"subscribers_{page}"
+        ),
+        InlineKeyboardButton(
+            "🔙 Back",
+            callback_data="back_admin"
+        )
+    ])
+
+    await query.edit_message_text(
+        text,
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(buttons)
     )
 
 
 # =========================================================
-# 15. MAIN
+# 20. STATISTICS
+# =========================================================
+
+async def show_statistics(query):
+
+    try:
+
+        with get_db() as conn:
+
+            total_users = conn.execute(
+                """
+                SELECT COUNT(*) AS total
+                FROM users
+                """
+            ).fetchone()["total"]
+
+            total_packs = conn.execute(
+                """
+                SELECT COUNT(*) AS total
+                FROM packs
+                """
+            ).fetchone()["total"]
+
+            total_broadcasts = conn.execute(
+                """
+                SELECT COUNT(*) AS total
+                FROM broadcast_stats
+                """
+            ).fetchone()["total"]
+
+            total_sent = conn.execute(
+                """
+                SELECT COALESCE(
+                    SUM(sent_count), 0
+                ) AS total
+                FROM broadcast_stats
+                """
+            ).fetchone()["total"]
+
+            total_failed = conn.execute(
+                """
+                SELECT COALESCE(
+                    SUM(failed_count), 0
+                ) AS total
+                FROM broadcast_stats
+                """
+            ).fetchone()["total"]
+
+            new_today = conn.execute(
+                """
+                SELECT COUNT(*) AS total
+                FROM users
+                WHERE created_at >= EXTRACT(
+                    EPOCH FROM CURRENT_DATE
+                )::BIGINT
+                """
+            ).fetchone()["total"]
+
+    except Exception as e:
+
+        logger.error(
+            "Statistics error: %s",
+            e
+        )
+
+        await query.edit_message_text(
+            "❌ Database error."
+        )
+
+        return
+
+    text = (
+        "📊 STATISTICS\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+
+        f"👥 Subscribers: {total_users}\n"
+        f"📈 New Today: +{new_today}\n"
+        f"📦 Total Packs: {total_packs}\n\n"
+
+        f"📤 Broadcasts: {total_broadcasts}\n"
+        f"✅ Messages Sent: {total_sent}\n"
+        f"❌ Failed: {total_failed}\n\n"
+
+        "━━━━━━━━━━━━━━━━━━"
+    )
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "🔄 Refresh",
+                callback_data="statistics"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🔙 Back",
+                callback_data="back_admin"
+            )
+        ]
+    ])
+
+    await query.edit_message_text(
+        text,
+        reply_markup=keyboard
+    )
+
+
+# =========================================================
+# 21. DELETE OLD PACKS
+# =========================================================
+
+async def delete_old_packs(query):
+
+    cutoff = int(time.time()) - (
+        OLD_PACK_DAYS * 24 * 60 * 60
+    )
+
+    try:
+
+        with get_db() as conn:
+
+            old_packs = conn.execute(
+                """
+                SELECT id, pack_code
+                FROM packs
+                WHERE created_at < %s
+                """,
+                (cutoff,)
+            ).fetchall()
+
+            count = len(old_packs)
+
+            for pack in old_packs:
+
+                pack_id = pack["id"]
+
+                conn.execute(
+                    """
+                    DELETE FROM pack_items
+                    WHERE pack_id=%s
+                    """,
+                    (pack_id,)
+                )
+
+                conn.execute(
+                    """
+                    DELETE FROM packs
+                    WHERE id=%s
+                    """,
+                    (pack_id,)
+                )
+
+            conn.commit()
+
+    except Exception as e:
+
+        logger.error(
+            "Old pack delete error: %s",
+            e
+        )
+
+        await query.edit_message_text(
+            "❌ Database error."
+        )
+
+        return
+
+    await query.edit_message_text(
+        "🗑️ OLD PACK CLEANUP\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+
+        f"Deleted Packs: {count}\n\n"
+
+        f"Only packs older than {OLD_PACK_DAYS} days "
+        "were deleted.\n\n"
+
+        "━━━━━━━━━━━━━━━━━━",
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "🔙 Back",
+                    callback_data="back_admin"
+                )
+            ]
+        ])
+    )
+
+
+# =========================================================
+# 22. CALLBACK BUTTONS
+# =========================================================
+
+async def button_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    query = update.callback_query
+
+    await query.answer()
+
+    if query.from_user.id != ADMIN_ID:
+
+        await query.answer(
+            "❌ Unauthorized.",
+            show_alert=True
+        )
+
+        return
+
+    data = query.data
+
+    # -------------------------------------------------
+    # CREATE PACK
+    # -------------------------------------------------
+
+    if data == "create_pack":
+
+        context.user_data["creating_pack"] = True
+        context.user_data["pack_items"] = []
+        context.user_data["broadcast_mode"] = False
+
+        await query.edit_message_text(
+            "🎬 NEW VIDEO PACK\n\n"
+            "এখন একে একে video/message পাঠাও।\n\n"
+            "শেষ হলে /done লিখো।\n\n"
+            "বাতিল করতে /cancelpack"
+        )
+
+        return
+
+    # -------------------------------------------------
+    # BROADCAST
+    # -------------------------------------------------
+
+    if data == "broadcast":
+
+        context.user_data["broadcast_mode"] = True
+        context.user_data["creating_pack"] = False
+
+        await query.edit_message_text(
+            "📢 BROADCAST MODE\n\n"
+            "এখন যে message/video/photo/link "
+            "সব subscribers-কে পাঠাতে চাও, "
+            "সেটা পাঠাও।\n\n"
+            "⚠️ এই message-টাই broadcast হবে।\n\n"
+            "❌ বাতিল করতে /admin চাপো।"
+        )
+
+        return
+
+    # -------------------------------------------------
+    # SUBSCRIBERS
+    # -------------------------------------------------
+
+    if data.startswith("subscribers_"):
+
+        page = int(
+            data.split("_")[1]
+        )
+
+        await show_subscribers(
+            query,
+            page
+        )
+
+        return
+
+    # -------------------------------------------------
+    # STATISTICS
+    # -------------------------------------------------
+
+    if data == "statistics":
+
+        await show_statistics(
+            query
+        )
+
+        return
+
+    # -------------------------------------------------
+    # DELETE OLD PACKS
+    # -------------------------------------------------
+
+    if data == "delete_old_packs":
+
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "✅ Yes, Delete",
+                    callback_data="confirm_delete_old"
+                ),
+                InlineKeyboardButton(
+                    "❌ Cancel",
+                    callback_data="back_admin"
+                )
+            ]
+        ])
+
+        await query.edit_message_text(
+            "⚠️ DELETE OLD PACKS\n\n"
+            f"This will permanently delete packs "
+            f"older than {OLD_PACK_DAYS} days.\n\n"
+            "Pack links for those packs will stop working.\n\n"
+            "Continue?",
+            reply_markup=keyboard
+        )
+
+        return
+
+    # -------------------------------------------------
+    # CONFIRM DELETE
+    # -------------------------------------------------
+
+    if data == "confirm_delete_old":
+
+        await delete_old_packs(
+            query
+        )
+
+        return
+
+    # -------------------------------------------------
+    # REFRESH
+    # -------------------------------------------------
+
+    if data == "refresh_admin":
+
+        await show_admin(
+            update,
+            context,
+            edit=True
+        )
+
+        return
+
+    # -------------------------------------------------
+    # BACK
+    # -------------------------------------------------
+
+    if data == "back_admin":
+
+        context.user_data["broadcast_mode"] = False
+
+        await show_admin(
+            update,
+            context,
+            edit=True
+        )
+
+        return
+
+
+# =========================================================
+# 23. MAIN
 # =========================================================
 
 async def main():
 
-    # =====================================================
-    # DATABASE FIRST
-    # =====================================================
+    # -------------------------------------------------
+    # DATABASE
+    # -------------------------------------------------
 
     init_database()
 
-    # =====================================================
-    # CREATE BOT
-    # =====================================================
+    # -------------------------------------------------
+    # CREATE APPLICATION
+    # -------------------------------------------------
 
     app = (
         Application.builder()
@@ -1099,9 +1846,9 @@ async def main():
         .build()
     )
 
-    # =====================================================
-    # USER COMMANDS
-    # =====================================================
+    # -------------------------------------------------
+    # COMMANDS
+    # -------------------------------------------------
 
     app.add_handler(
         CommandHandler(
@@ -1116,10 +1863,6 @@ async def main():
             stop
         )
     )
-
-    # =====================================================
-    # ADMIN COMMANDS
-    # =====================================================
 
     app.add_handler(
         CommandHandler(
@@ -1149,9 +1892,19 @@ async def main():
         )
     )
 
-    # =====================================================
+    # -------------------------------------------------
+    # INLINE BUTTONS
+    # -------------------------------------------------
+
+    app.add_handler(
+        CallbackQueryHandler(
+            button_handler
+        )
+    )
+
+    # -------------------------------------------------
     # ADMIN MESSAGES
-    # =====================================================
+    # -------------------------------------------------
 
     app.add_handler(
         MessageHandler(
@@ -1160,13 +1913,9 @@ async def main():
         )
     )
 
-    # =====================================================
-    # DELETE WORKER
-    # =====================================================
-
-    asyncio.create_task(
-        delete_old_messages(app)
-    )
+    # -------------------------------------------------
+    # START BOT FIRST
+    # -------------------------------------------------
 
     print("==============================")
     print("DATABASE READY")
@@ -1176,6 +1925,14 @@ async def main():
     await app.initialize()
     await app.start()
     await app.updater.start_polling()
+
+    # -------------------------------------------------
+    # DELETE WORKER AFTER BOT START
+    # -------------------------------------------------
+
+    delete_task = asyncio.create_task(
+        delete_old_messages(app)
+    )
 
     try:
 
@@ -1187,6 +1944,13 @@ async def main():
 
     finally:
 
+        delete_task.cancel()
+
+        try:
+            await delete_task
+        except asyncio.CancelledError:
+            pass
+
         await app.updater.stop()
         await app.stop()
         await app.shutdown()
@@ -1196,4 +1960,5 @@ async def main():
 # START
 # =========================================================
 
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())
